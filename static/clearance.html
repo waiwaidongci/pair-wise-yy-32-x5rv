@@ -1,0 +1,106 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>清场复核</title>
+<style>
+body{font:15px system-ui;max-width:1200px;margin:24px auto;padding:0 20px}
+table{border-collapse:collapse;width:100%;margin:8px 0}td,th{border:1px solid #d0d7de;padding:4px 8px;text-align:left}
+button{padding:6px 12px;margin:2px}input,select{padding:4px;margin:2px}
+pre{background:#f3f5f7;padding:12px;overflow:auto}
+.bad{color:#b42318;font-weight:600}.ok{color:#067647;font-weight:600}
+.card{border:1px solid #d0d7de;border-radius:8px;padding:12px;margin:12px 0}
+h2{font-size:17px;margin:4px 0 8px}h3,h4{margin:10px 0 6px}
+</style>
+<h1>清场复核</h1>
+<p>换品种开工登记 → 清洁后填残留读数 → 另一名质检员在有效期内复核。<b>超限、迟到或同人复核</b>会停在<b>待复核</b>并写明原因；改品种、参数或重新取样会使原结论失效（旧记录仍可查）。清场通过前，挂在该设备上的批次不能补录检验或申请放行；设备被占用时不得开工。</p>
+<div class="card">身份 <input id="actor" value="op1"> 角色 <select id="role"><option>operator</option><option selected>inspector</option><option>lab</option><option>qa</option></select>
+工厂ID <input id="factory" type="number" value="1" style="width:70px"> <button onclick="refresh()">刷新</button> <a href="/">批次放行页</a></div>
+<pre id="msg" style="display:none"></pre>
+<div class="card"><h2>设备</h2><div id="equipment">加载中...</div>
+代号 <input id="eqCode" placeholder="EQ-1"> 名称 <input id="eqName" placeholder="灌装线1"> <button onclick="addEquipment()">注册设备</button></div>
+<div class="card"><h2>开工登记</h2>
+设备 <select id="openEq"></select> 上一品种 <input id="pp" placeholder="高活性品种A"> 上一批次 <input id="pb" placeholder="P-001">
+复核有效期(小时) <input id="win" type="number" value="24" style="width:70px">
+<div id="points"></div><button onclick="addPoint()">+ 取样点</button> <button onclick="openClearance()">开工登记</button></div>
+<div class="card"><h2>清场记录（含已失效旧记录）</h2><div id="list">加载中...</div></div>
+<div class="card"><h2>记录详情</h2><div id="detail">请选择一条记录。</div></div>
+<script>
+let POINT_ROWS=0;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function hdrs(){return {'Content-Type':'application/json','X-Actor':$('actor').value,'X-Role':$('role').value}}
+async function api(method,path,body){
+  const r=await fetch(path,{method,headers:hdrs(),body:body?JSON.stringify(body):undefined});
+  const data=await r.json();
+  if(!r.ok){show(data.error||r.statusText,true);throw new Error(data.error)}
+  return data;
+}
+function show(text,bad){const m=$('msg');m.style.display='block';m.className=bad?'bad':'ok';m.textContent=typeof text==='string'?text:JSON.stringify(text,null,2)}
+async function refresh(){
+  const fid=$('factory').value;
+  const eq=await (await fetch('/api/equipment?factory_id='+fid)).json();
+  $('equipment').innerHTML='<table><tr><th>ID</th><th>代号</th><th>名称</th><th>当前清场</th></tr>'+eq.equipment.map(e=>
+    `<tr><td>${e.id}</td><td>${esc(e.code)}</td><td>${esc(e.name)}</td><td>${e.active_status_label?esc(e.active_status_label)+' (#'+e.active_clearance_id+')':'空闲'}</td></tr>`).join('')+'</table>';
+  $('openEq').innerHTML=eq.equipment.map(e=>`<option value="${e.id}">${esc(e.code)} ${esc(e.name)}</option>`).join('');
+  const cl=await (await fetch('/api/clearances')).json();
+  $('list').innerHTML='<table><tr><th>ID</th><th>设备</th><th>版本</th><th>上一品种/批次</th><th>状态</th><th>待复核原因</th><th>登记</th><th></th></tr>'+cl.clearances.map(c=>
+    `<tr><td>${c.id}</td><td>${esc(c.equipment_code||c.equipment_id)}</td><td>v${c.revision}</td><td>${esc(c.prev_product)} / ${esc(c.prev_batch_no)}</td>
+     <td class="${c.status==='passed'?'ok':c.status==='invalidated'?'':'bad'}">${esc(c.status_label)}</td>
+     <td class="bad">${esc(c.blocked_reason||'')}</td><td>${esc(c.registered_by)} ${esc(c.registered_at)}</td>
+     <td><button onclick="detail(${c.id})">详情</button></td></tr>`).join('')+'</table>';
+}
+async function detail(id){
+  const d=await api('GET','/api/clearances/'+id),c=d.clearance;
+  let h=`<h3>#${c.id} v${c.revision} — ${esc(c.status_label)}</h3>
+  <p>设备 #${c.equipment_id} ｜ 上一品种/批次：${esc(c.prev_product)} / ${esc(c.prev_batch_no)} ｜ 复核有效期 ${c.review_window_hours}h<br>
+  登记：${esc(c.registered_by)} ${esc(c.registered_at)} ｜ 填数：${esc(c.cleaned_by||'—')} ${esc(c.cleaned_at||'')} ｜ 有效期至：${esc(c.review_valid_until||'—')} ｜ 复核：${esc(c.reviewed_by||'—')} ${esc(c.reviewed_at||'')}<br>
+  ${c.blocked_reason?'<span class="bad">待复核原因：'+esc(c.blocked_reason)+'</span><br>':''}
+  ${c.invalidated_reason?'<span class="bad">已失效：'+esc(c.invalidated_reason)+' '+esc(c.invalidated_at||'')+'</span><br>':''}</p>`;
+  if(c.status!=='invalidated'){
+    h+=`<h4>残留读数${d.readings.length?'（重新提交 = 重新取样，原结论失效并生成新版本）':''}</h4>
+    <table><tr><th>取样点</th><th>残留限度</th><th>读数</th></tr>${c.sampling_points.map((p,i)=>
+      `<tr><td>${esc(p.name)}</td><td>${p.limit}</td><td><input id="rd_${i}" data-point="${esc(p.name)}" type="number" step="any"></td></tr>`).join('')}</table>
+    <button onclick="submitReadings(${c.id},${c.sampling_points.length})">提交读数</button>`;
+  }
+  if(c.status==='pending_review') h+=` <button onclick="review(${c.id})">以当前身份复核</button>`;
+  if(c.status!=='invalidated'){
+    h+=`<h4>修改品种/参数（原结论失效，生成新版本）</h4>
+    上一品种 <input id="am_pp" value="${esc(c.prev_product)}"> 上一批次 <input id="am_pb" value="${esc(c.prev_batch_no)}">
+    取样点(JSON) <input id="am_pts" size="60" value='${esc(JSON.stringify(c.sampling_points))}'>
+    <button onclick="amend(${c.id})">提交修改</button>`;
+  }
+  if(d.readings.length) h+='<h4>读数记录</h4><table><tr><th>取样点</th><th>读数</th><th>限度</th><th>判定</th><th>填数人</th><th>时间</th></tr>'+d.readings.map(r=>
+    `<tr><td>${esc(r.point)}</td><td>${r.reading}</td><td>${r.limit}</td><td class="${r.over_limit?'bad':'ok'}">${r.over_limit?'超限':'合格'}</td><td>${esc(r.recorded_by)}</td><td>${esc(r.created_at)}</td></tr>`).join('')+'</table>';
+  if(d.reviews.length) h+='<h4>复核记录</h4><table><tr><th>复核人</th><th>结果</th><th>原因</th><th>时间</th></tr>'+d.reviews.map(r=>
+    `<tr><td>${esc(r.reviewer)}</td><td class="${r.result==='passed'?'ok':'bad'}">${r.result==='passed'?'通过':'不通过'}</td><td>${esc(r.reason)}</td><td>${esc(r.created_at)}</td></tr>`).join('')+'</table>';
+  if(d.history.length) h+='<h4>历史版本（旧记录）</h4><table><tr><th>ID</th><th>版本</th><th>状态</th><th>失效原因</th><th></th></tr>'+d.history.map(x=>
+    `<tr><td>${x.id}</td><td>v${x.revision}</td><td>${esc(x.status_label)}</td><td>${esc(x.invalidated_reason||'')}</td><td><button onclick="detail(${x.id})">查看</button></td></tr>`).join('')+'</table>';
+  $('detail').innerHTML=h;
+}
+async function submitReadings(id,n){
+  const readings=[];
+  for(let i=0;i<n;i++){const el=$('rd_'+i);readings.push({point:el.dataset.point,value:parseFloat(el.value)})}
+  const d=await api('POST','/api/clearances/'+id+'/readings',{factory_id:+$('factory').value,readings});
+  show('读数已提交，记录 #'+d.clearance.id+' 状态：'+d.clearance.status_label);
+  await refresh();await detail(d.clearance.id);
+}
+async function review(id){
+  const d=await api('POST','/api/clearances/'+id+'/review',{factory_id:+$('factory').value});
+  show(d.clearance.status==='passed'?'复核通过':'复核不通过，停在待复核：'+(d.clearance.blocked_reason||''),d.clearance.status!=='passed');
+  await refresh();await detail(id);
+}
+async function amend(id){
+  let pts;try{pts=JSON.parse($('am_pts').value)}catch(e){show('取样点 JSON 无效',true);return}
+  const d=await api('POST','/api/clearances/'+id+'/amend',{factory_id:+$('factory').value,prev_product:$('am_pp').value,prev_batch_no:$('am_pb').value,sampling_points:pts});
+  show('已修改并生成新版本 #'+d.clearance.id+'，原记录已失效（仍可查）');
+  await refresh();await detail(d.clearance.id);
+}
+async function addEquipment(){const d=await api('POST','/api/equipment',{factory_id:+$('factory').value,code:$('eqCode').value,name:$('eqName').value});show('设备已注册 #'+d.id);await refresh()}
+function addPoint(){const i=POINT_ROWS++,div=document.createElement('div');div.id='pt_'+i;
+  div.innerHTML=`取样点 <input id="ptn_${i}" placeholder="搅拌桨"> 残留限度 <input id="ptl_${i}" type="number" step="any" value="10">`;
+  $('points').appendChild(div)}
+async function openClearance(){
+  const sampling_points=[];
+  for(let i=0;i<POINT_ROWS;i++){const n=$('ptn_'+i),l=$('ptl_'+i);if(n&&n.value.trim())sampling_points.push({name:n.value.trim(),limit:parseFloat(l.value)})}
+  const d=await api('POST','/api/clearances',{factory_id:+$('factory').value,equipment_id:+$('openEq').value,prev_product:$('pp').value,prev_batch_no:$('pb').value,sampling_points,review_window_hours:+$('win').value});
+  show('开工登记完成 #'+d.clearance.id+'（清洁中）');await refresh();
+}
+addPoint();addPoint();refresh().catch(e=>show(e.message,true));
+</script>

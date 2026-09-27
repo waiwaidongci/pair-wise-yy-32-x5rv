@@ -1,0 +1,122 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>清场复核</title>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto;white-space:pre-wrap}
+button{padding:6px 12px;margin:2px}
+.card{border:1px solid #ccc;border-radius:6px;padding:12px;margin:12px 0}
+.card.passed{border-color:#2e7d32}.card.pending_review{border-color:#f9a825}.card.superseded{opacity:.65}
+.st{font-weight:700}.passed .st{color:#2e7d32}.pending_review .st{color:#f9a825}.cleaning .st{color:#1565c0}.superseded .st{color:#757575}
+.blocked{color:#c62828;font-weight:700;margin:6px 0}
+table{border-collapse:collapse;margin:6px 0}td,th{padding:4px 10px}
+input,select,textarea{padding:4px;margin:2px}
+</style>
+<h1>清场复核</h1>
+<p>开工登记上一品种、批次和取样点 → 清洁后填残留读数 → 另一名质检员（inspector）在有效期内复核。超限、迟到或同人复核会停在<b>待复核</b>并写明原因；清场通过前绑定设备不得补录检验或申请放行，设备被占用时不得开工；改品种、参数或重新取样会使原结论失效，旧记录仍可查。</p>
+<div>
+  身份 <input id="actor" value="insp-2" size="8">
+  角色 <select id="role"><option>operator</option><option selected>inspector</option><option>lab</option><option>qa</option></select>
+  工厂 <input id="factory" type="number" value="1" style="width:5em">
+  <button onclick="board()">刷新</button>
+  <a href="/">返回批次放行</a>
+</div>
+<pre id="msg">就绪</pre>
+
+<h2>设备台账</h2>
+<div id="equipment"></div>
+<p>代号 <input id="eqCode" size="8"> 名称 <input id="eqName" size="12"> <button onclick="addEquipment()">登记设备（qa）</button></p>
+
+<h2>开工登记（operator / inspector）</h2>
+<p>设备 <select id="runEq"></select>
+上一品种 <input id="prevProduct" size="10" placeholder="高活性品种A">
+上一批次 <input id="prevBatch" size="8" placeholder="A-001">
+复核有效期 <input id="validUntil" type="datetime-local"></p>
+<p>取样点（每行：点位|限值）<br><textarea id="points" rows="3" cols="30">搅拌桨|10
+出料口|5</textarea>
+<button onclick="registerRun()">开工登记</button></p>
+
+<h2>清场记录（全部版本，旧记录可查）</h2>
+<div id="runs"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const STATUS = {cleaning: '清洁中（待填读数）', pending_review: '待复核', passed: '已通过', superseded: '已失效'};
+function headers(){ return {'Content-Type': 'application/json', 'X-Actor': $('actor').value.trim(), 'X-Role': $('role').value}; }
+async function api(path, method, body){
+  const opt = {method: method || 'GET', headers: headers()};
+  if (body) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  return d;
+}
+function say(t){ $('msg').textContent = typeof t === 'string' ? t : JSON.stringify(t, null, 2); }
+async function run(fn){ try{ const r = await fn(); if (r) say(r); await board(); }catch(e){ say('错误：' + e.message); } }
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function parsePoints(text){
+  return text.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+    const parts = l.split('|');
+    return {point: (parts[0] || '').trim(), limit: parseFloat(parts[1])};
+  });
+}
+async function board(){
+  const d = await api('/api/factories/' + $('factory').value + '/clearances');
+  $('equipment').innerHTML = '<table border="1"><tr><th>ID</th><th>代号</th><th>名称</th></tr>' +
+    d.equipment.map(e => `<tr><td>${e.id}</td><td>${esc(e.code)}</td><td>${esc(e.name)}</td></tr>`).join('') + '</table>';
+  $('runEq').innerHTML = d.equipment.map(e => `<option value="${e.id}">${esc(e.code)} ${esc(e.name)}</option>`).join('');
+  $('runs').innerHTML = d.runs.map(renderRun).join('') || '<p>暂无清场记录</p>';
+}
+function renderRun(d){
+  const r = d.run;
+  const pts = r.points.map(p => {
+    const rd = d.readings.find(x => x.point === p.point);
+    return `<tr><td>${esc(p.point)}</td><td>${p.limit}</td><td>${rd ? rd.value : '—'}</td><td>${rd ? (rd.over ? '超限' : '合格') : '—'}</td></tr>`;
+  }).join('');
+  const revs = d.reviews.map(v => `<li>${esc(v.created_at)} ${esc(v.reviewed_by)} ${v.outcome === 'passed' ? '通过' : '滞留'}${v.reason ? '：' + esc(v.reason) : ''}</li>`).join('');
+  let actions = '';
+  if (r.status === 'cleaning')
+    actions = r.points.map(p => `${esc(p.point)} <input size="4" data-run="${r.id}" data-point="${esc(p.point)}">`).join(' ') +
+      `<button onclick="fill(${r.id})">填写读数</button>`;
+  if (r.status === 'pending_review') actions += `<button onclick="review(${r.id})">复核</button>`;
+  if (r.status !== 'superseded') actions += `<button onclick="revise(${r.id})">改品种/参数</button><button onclick="resample(${r.id})">重新取样</button>`;
+  return `<div class="card ${r.status}">
+    <b>${esc(r.equipment_code || '')}</b> v${r.version} <span class="st">${STATUS[r.status]}</span>
+    上一品种/批次：${esc(r.prev_product)} / ${esc(r.prev_batch_no)} ｜ 有效期至 ${esc(r.valid_until)}<br>
+    登记 ${esc(r.registered_by)} ｜ 填报 ${esc(r.filled_by || '—')} ｜ 复核 ${esc(r.reviewed_by || '—')}${r.change_note ? ' ｜ 变更：' + esc(r.change_note) : ''}
+    ${r.blocked_reason ? `<div class="blocked">滞留原因：${esc(r.blocked_reason)}</div>` : ''}
+    <table border="1"><tr><th>取样点</th><th>限值</th><th>读数</th><th>判定</th></tr>${pts}</table>
+    ${revs ? '<ul>' + revs + '</ul>' : ''}
+    ${actions}
+  </div>`;
+}
+function fill(runId){
+  const readings = [...document.querySelectorAll(`input[data-run="${runId}"]`)]
+    .map(i => ({point: i.dataset.point, value: parseFloat(i.value)}));
+  run(() => api('/api/clearances/' + runId + '/readings', 'POST', {readings}));
+}
+function review(id){ run(() => api('/api/clearances/' + id + '/review', 'POST', {})); }
+function revise(id){
+  const prev_product = prompt('新的上一品种（留空不变）') || undefined;
+  const lines = prompt('新的取样点（每行 点位|限值，留空不变）');
+  const hours = prompt('新的复核有效期（小时，留空沿用）');
+  const body = {prev_product};
+  if (lines) body.points = parsePoints(lines);
+  if (hours) body.valid_until = new Date(Date.now() + hours * 3600e3).toISOString();
+  run(() => api('/api/clearances/' + id + '/revise', 'POST', body));
+}
+function resample(id){
+  const hours = prompt('新的复核有效期（小时，留空沿用）');
+  const body = {};
+  if (hours) body.valid_until = new Date(Date.now() + hours * 3600e3).toISOString();
+  run(() => api('/api/clearances/' + id + '/resample', 'POST', body));
+}
+function addEquipment(){ run(() => api('/api/equipment', 'POST', {factory_id: +$('factory').value, code: $('eqCode').value, name: $('eqName').value})); }
+function registerRun(){
+  run(() => api('/api/clearances', 'POST', {
+    factory_id: +$('factory').value, equipment_id: +$('runEq').value,
+    prev_product: $('prevProduct').value, prev_batch_no: $('prevBatch').value,
+    points: parsePoints($('points').value),
+    valid_until: new Date($('validUntil').value).toISOString()
+  }));
+}
+board().catch(e => say('错误：' + e.message));
+</script>

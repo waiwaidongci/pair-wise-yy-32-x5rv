@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pharmaceutical batch deviation, rework and release decision service."""
+"""Pharmaceutical batch deviation, line clearance and release decision service."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,10 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+from clearance_service import ClearanceService
+from clearance_store import ClearanceStore
+from errors import ApiError
 
 DB_PATH = Path(__file__).with_name("data.db")
 
@@ -31,11 +35,6 @@ def j(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
-
-
 class Store:
     def __init__(self, path: str | Path = DB_PATH):
         self.path = str(path)
@@ -49,7 +48,7 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS batches (
           id INTEGER PRIMARY KEY AUTOINCREMENT, factory_id INTEGER NOT NULL REFERENCES factories(id),
-          batch_no TEXT NOT NULL, product TEXT NOT NULL, mfg_date TEXT NOT NULL, expiry_date TEXT NOT NULL,
+          equipment_id INTEGER, batch_no TEXT NOT NULL, product TEXT NOT NULL, mfg_date TEXT NOT NULL, expiry_date TEXT NOT NULL,
           state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected')),
           revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           UNIQUE(factory_id,batch_no)
@@ -92,6 +91,9 @@ class Store:
         );
         """)
         self.conn.commit()
+        if "equipment_id" not in [row[1] for row in self.conn.execute("PRAGMA table_info(batches)")]:
+            self.conn.execute("ALTER TABLE batches ADD COLUMN equipment_id INTEGER")
+            self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -102,7 +104,8 @@ class Store:
 
 
 class BatchService:
-    def __init__(self, store: Store): self.store, self.conn = store, store.conn
+    def __init__(self, store: Store, clearance: ClearanceService | None = None):
+        self.store, self.conn, self.clearance = store, store.conn, clearance
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -131,16 +134,19 @@ class BatchService:
         except sqlite3.IntegrityError as exc: raise ApiError(409, "工厂代号已存在") from exc
         return {"id": cur.lastrowid, "code": code, "name": name, "country": country}
 
-    def create_batch(self, actor: str | None, role: str | None, factory_id: int, batch_no: str, product: str, mfg_date: str, expiry_date: str) -> dict:
+    def create_batch(self, actor: str | None, role: str | None, factory_id: int, batch_no: str, product: str, mfg_date: str, expiry_date: str, equipment_id: int | None = None) -> dict:
         actor = self._actor(actor, role, {"operator"})
         self._factory_check(actor, factory_id)
         if not batch_no.strip() or not product.strip() or expiry_date <= mfg_date: raise ApiError(400, "批号、产品或有效期不合法")
+        if equipment_id:
+            if not self.clearance: raise ApiError(400, "未启用清场复核，不能绑定设备")
+            self.clearance.assert_equipment_available(factory_id, equipment_id)
         stamp = now()
         try:
             with self.conn:
-                cur = self.conn.execute("""INSERT INTO batches(factory_id,batch_no,product,mfg_date,expiry_date,state,created_by,created_at,updated_at)
-                                         VALUES(?,?,?,?,?, 'manufactured',?,?,?)""",
-                                        (factory_id, batch_no, product, mfg_date, expiry_date, actor, stamp, stamp))
+                cur = self.conn.execute("""INSERT INTO batches(factory_id,equipment_id,batch_no,product,mfg_date,expiry_date,state,created_by,created_at,updated_at)
+                                         VALUES(?,?,?,?,?,?, 'manufactured',?,?,?)""",
+                                        (factory_id, equipment_id, batch_no, product, mfg_date, expiry_date, actor, stamp, stamp))
                 self.store.audit(actor, "batch.create", "batch", cur.lastrowid, {"factory_id": factory_id, "batch_no": batch_no})
         except sqlite3.IntegrityError as exc: raise ApiError(409, "该工厂批号已存在") from exc
         return self._batch_dict(self._row("batches", cur.lastrowid))
@@ -185,6 +191,8 @@ class BatchService:
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
         if not test_type.strip() or spec_min > spec_max: raise ApiError(400, "检验项目或标准不合法")
         if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不能补录检验")
+        if self.clearance and batch["equipment_id"]:
+            self.clearance.require_passed(batch["equipment_id"], "补录检验")
         round_no = self.conn.execute("SELECT COALESCE(MAX(round),0)+1 FROM tests WHERE batch_id=? AND test_type=?", (batch_id, test_type)).fetchone()[0]
         passed = int(spec_min <= result <= spec_max)
         with self.conn:
@@ -242,6 +250,8 @@ class BatchService:
         if batch["state"] in {"released", "rejected"}: raise ApiError(409, "批次已经是终态")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次已被其他工厂或质量人员修改，请刷新版本")
         if not rationale.strip(): raise ApiError(400, "必须填写决定依据")
+        if decision in {"release", "conditional"} and self.clearance and batch["equipment_id"]:
+            self.clearance.require_passed(batch["equipment_id"], "申请放行")
         deviations = self.conn.execute("SELECT * FROM deviations WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
         open_deviations = [d for d in deviations if d["status"] == "open"]
         latest_tests: dict[str, sqlite3.Row] = {}
@@ -288,12 +298,16 @@ class BatchService:
     def batch_detail(self, batch_id: int) -> dict:
         batch = self._batch_dict(self._row("batches", batch_id))
         def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
-        return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
-                "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
-                "decisions": rows("decisions")}
+        detail = {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
+                  "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
+                  "decisions": rows("decisions")}
+        if self.clearance and batch["equipment_id"]:
+            latest = self.clearance.store.latest_run(batch["equipment_id"])
+            detail["clearance"] = self.clearance.run_detail(latest["id"]) if latest else None
+        return detail
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
-        return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
+        return {"id": row["id"], "factory_id": row["factory_id"], "equipment_id": row["equipment_id"], "batch_no": row["batch_no"], "product": row["product"],
                 "mfg_date": row["mfg_date"], "expiry_date": row["expiry_date"], "state": row["state"], "revision": row["revision"]}
 
     @staticmethod
@@ -308,21 +322,32 @@ class BatchService:
                 "spec_min": row["spec_min"], "spec_max": row["spec_max"], "passed": bool(row["passed"]), "round": row["round"]}
 
     def state(self) -> dict:
-        return {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
-                "batches": [self._batch_dict(row) for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC")],
-                "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
+        out = {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
+               "batches": [self._batch_dict(row) for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC")],
+               "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
+        if self.clearance:
+            out["equipment"] = self.clearance.equipment_list()
+            out["clearances"] = self.clearance.recent_runs()
+        return out
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM factories LIMIT 1").fetchone():
-            self.register_factory("qa-demo", "qa", "F-DEMO", "演示工厂", "CN")
+            factory = self.register_factory("qa-demo", "qa", "F-DEMO", "演示工厂", "CN")
+        else:
+            factory = self.conn.execute("SELECT id FROM factories LIMIT 1").fetchone()
+        if self.clearance and not self.conn.execute("SELECT id FROM equipment LIMIT 1").fetchone():
+            self.clearance.register_equipment("qa-demo", "qa", factory["id"], "EQ-001", "演示反应釜")
 
 
 class Handler(BaseHTTPRequestHandler):
     service: BatchService
+    clearance: ClearanceService
 
     def log_message(self, fmt: str, *args: object) -> None: sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
     def _send(self, status: int, body: object) -> None:
         data = json.dumps(body, ensure_ascii=False).encode(); self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def _page(self, name: str) -> None:
+        page = (Path(__file__).parent / "static" / name).read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page)
     def _body(self) -> dict:
         size = int(self.headers.get("Content-Length", "0"))
         try: return json.loads(self.rfile.read(size)) if size else {}
@@ -335,8 +360,11 @@ class Handler(BaseHTTPRequestHandler):
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
             elif len(p) == 3 and p[:2] == ["api", "batches"]: out = self.service.batch_detail(int(p[2]))
-            elif not p:
-                page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
+            elif len(p) == 3 and p[:2] == ["api", "clearances"]: out = self.clearance.run_detail(int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "equipment"] and p[3] == "clearances": out = self.clearance.equipment_history(int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "factories"] and p[3] == "clearances": out = self.clearance.factory_board(int(p[2]))
+            elif not p: self._page("index.html"); return
+            elif p == ["clearance"]: self._page("clearance.html"); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
@@ -346,7 +374,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             p, b = self._parts(), self._body(); actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if p == ["api", "factories"]: out = self.service.register_factory(actor, role, b.get("code", ""), b.get("name", ""), b.get("country", ""))
-            elif p == ["api", "batches"]: out = self.service.create_batch(actor, role, int(b.get("factory_id", 0)), b.get("batch_no", ""), b.get("product", ""), b.get("mfg_date", ""), b.get("expiry_date", ""))
+            elif p == ["api", "batches"]: out = self.service.create_batch(actor, role, int(b.get("factory_id", 0)), b.get("batch_no", ""), b.get("product", ""), b.get("mfg_date", ""), b.get("expiry_date", ""), int(b["equipment_id"]) if b.get("equipment_id") else None)
+            elif p == ["api", "equipment"]: out = self.clearance.register_equipment(actor, role, int(b.get("factory_id", 0)), b.get("code", ""), b.get("name", ""))
+            elif p == ["api", "clearances"]: out = self.clearance.register_run(actor, role, int(b.get("factory_id", 0)), int(b.get("equipment_id", 0)), b.get("prev_product", ""), b.get("prev_batch_no", ""), b.get("points"), b.get("valid_until", ""))
+            elif len(p) == 4 and p[:2] == ["api", "clearances"] and p[3] == "readings": out = self.clearance.fill_readings(actor, role, int(p[2]), b.get("readings"))
+            elif len(p) == 4 and p[:2] == ["api", "clearances"] and p[3] == "review": out = self.clearance.review(actor, role, int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "clearances"] and p[3] == "revise": out = self.clearance.revise(actor, role, int(p[2]), b.get("prev_product"), b.get("prev_batch_no"), b.get("points"), b.get("valid_until"), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "clearances"] and p[3] == "resample": out = self.clearance.resample(actor, role, int(p[2]), b.get("valid_until"), b.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "deviations": out = self.service.add_deviation(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("severity", ""), b.get("title", ""), b.get("due_at"), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "deviations"] and p[3] == "close": out = self.service.close_deviation(actor, role, int(p[2]), b.get("corrective_action", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "deviations"] and p[3] == "exception": out = self.service.approve_exception(actor, role, int(p[2]), b.get("reason", ""), b.get("until", ""), int(b.get("expected_revision", -1)))
@@ -364,9 +398,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run(port: int, db_path: str, seed: bool) -> None:
-    store = Store(db_path); service = BatchService(store)
+    store = Store(db_path)
+    clearance = ClearanceService(ClearanceStore(store.conn), store.audit)
+    service = BatchService(store, clearance)
     if seed: service.seed()
-    Handler.service = service
+    Handler.service, Handler.clearance = service, clearance
     print(f"batch release listening on http://127.0.0.1:{port}")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
